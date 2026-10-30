@@ -37,6 +37,12 @@ static QPC_TICKS_PER_SECOND: LazyLock<u64> = LazyLock::new(|| {
 const VSYNC_INTERVAL_THRESHOLD: Duration = Duration::from_millis(1);
 const DEFAULT_VSYNC_INTERVAL: Duration = Duration::from_micros(16_666); // ~60Hz
 
+/// Set when the platform window receives `WM_DISPLAYCHANGE`, so the pacing
+/// controller recomputes the rate groups on its next wake instead of waiting
+/// for the periodic recheck. The flag is process-global because there is one
+/// pacing controller per process.
+pub(crate) static DISPLAYS_DIRTY: AtomicBool = AtomicBool::new(false);
+
 /// Blocks until the next vblank of the paced output, or the DWM composition
 /// clock for outputs whose vblank is not available.
 pub(crate) enum PacingWaiter {
@@ -196,6 +202,7 @@ fn enumerate_outputs(factory: &IDXGIFactory6) -> SmallVec<[(HMONITOR, IDXGIOutpu
 pub(crate) struct PacingThreads {
     shared: Arc<PacingShared>,
     waiters: Vec<WaiterHandle>,
+    last_summary: Option<String>,
 }
 
 struct PacingShared {
@@ -227,6 +234,7 @@ impl PacingThreads {
                 recovering: AtomicBool::new(false),
             }),
             waiters: Vec::new(),
+            last_summary: None,
         };
         this.refresh(devices);
         this
@@ -242,7 +250,10 @@ impl PacingThreads {
             .map(RateGroup::summary)
             .collect::<Vec<_>>()
             .join(", ");
-        log::info!("vsync pacing groups: {summary}");
+        if self.last_summary.as_deref() != Some(summary.as_str()) {
+            log::info!("vsync pacing groups: {summary}");
+            self.last_summary = Some(summary);
+        }
 
         *self.shared.groups.write() = groups.clone();
         self.waiters.retain(|waiter| {

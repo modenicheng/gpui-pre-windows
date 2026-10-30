@@ -56,6 +56,12 @@ impl TrackedWindow {
 /// device check of the former single vsync loop.
 const DEVICE_CHECK_INTERVAL: Duration = Duration::from_millis(16);
 
+/// How often the controller thread re-derives the output rate groups when no
+/// WM_DISPLAYCHANGE was reported, as a safety net for display topology and
+/// refresh-rate changes that arrive without a broadcast the platform window
+/// sees.
+const RATE_RECHECK_INTERVAL: Duration = Duration::from_millis(500);
+
 pub struct WindowsPlatform {
     inner: Rc<WindowsPlatformInner>,
     raw_window_handles: Arc<RwLock<SmallVec<[TrackedWindow; 4]>>>,
@@ -463,6 +469,7 @@ impl WindowsPlatform {
             .spawn(move || {
                 let mut pacing =
                     PacingThreads::start(&directx_device, all_windows.clone(), stop.clone());
+                let mut groups_refreshed_at = std::time::Instant::now();
                 loop {
                     if stop.load(Ordering::Acquire) {
                         break;
@@ -481,6 +488,17 @@ impl WindowsPlatform {
                             panic!("Device lost: {err}");
                         }
                         pacing.resume(&directx_device);
+                        groups_refreshed_at = std::time::Instant::now();
+                    }
+                    // Follow display mode and refresh-rate changes: promptly
+                    // when the platform window reports WM_DISPLAYCHANGE, and
+                    // as a safety net on a slow recheck that also covers
+                    // changes no broadcast was sent for.
+                    if DISPLAYS_DIRTY.swap(false, Ordering::AcqRel)
+                        || groups_refreshed_at.elapsed() >= RATE_RECHECK_INTERVAL
+                    {
+                        pacing.refresh(&directx_device);
+                        groups_refreshed_at = std::time::Instant::now();
                     }
                     std::thread::sleep(DEVICE_CHECK_INTERVAL);
                 }
@@ -1219,6 +1237,9 @@ impl WindowsPlatformInner {
     }
 
     fn handle_display_change(&self, handle: HWND) -> Option<isize> {
+        // Wake the pacing controller's recheck on its next poll; the rate
+        // groups re-derive from the current display modes.
+        DISPLAYS_DIRTY.store(true, Ordering::Release);
         // Broadcasts can be delivered while the app is mid-update, e.g. inside a
         // COM call, so report the change from the message loop instead.
         unsafe {
