@@ -162,6 +162,13 @@ impl PlatformDisplay for WindowsDisplay {
 /// The refresh rate of the monitor's current mode. With variable refresh
 /// rate, the mode's rate is the maximum.
 fn refresh_interval_for_device(device_name: &[u16; 32]) -> Option<std::time::Duration> {
+    refresh_hz_for_device(device_name).and_then(|hz| refresh_interval_from_hz(f64::from(hz)))
+}
+
+/// The refresh rate of the monitor's current mode, in hertz, for pacing
+/// windows against the output they are on. With variable refresh rate, the
+/// mode's rate is the maximum.
+fn refresh_hz_for_device(device_name: &[u16; 32]) -> Option<u32> {
     let mut mode = DEVMODEW {
         dmSize: std::mem::size_of::<DEVMODEW>() as u16,
         ..Default::default()
@@ -182,10 +189,15 @@ fn refresh_interval_for_device(device_name: &[u16; 32]) -> Option<std::time::Dur
     if mode.dmDisplayFrequency <= 1 {
         return None;
     }
-    refresh_interval_from_hz(f64::from(mode.dmDisplayFrequency))
+    Some(mode.dmDisplayFrequency)
 }
 
-fn available_monitors() -> SmallVec<[HMONITOR; 4]> {
+/// The current refresh rate of the monitor, in hertz.
+pub(crate) fn refresh_hz_for_monitor(hmonitor: HMONITOR) -> Option<u32> {
+    refresh_hz_for_device(&get_monitor_info(hmonitor).ok()?.szDevice)
+}
+
+pub(crate) fn available_monitors() -> SmallVec<[HMONITOR; 4]> {
     let mut monitors: SmallVec<[HMONITOR; 4]> = SmallVec::new();
     unsafe {
         EnumDisplayMonitors(
@@ -211,7 +223,7 @@ unsafe extern "system" fn monitor_enum_proc(
     BOOL(1)
 }
 
-fn get_monitor_info(hmonitor: HMONITOR) -> anyhow::Result<MONITORINFOEXW> {
+pub(crate) fn get_monitor_info(hmonitor: HMONITOR) -> anyhow::Result<MONITORINFOEXW> {
     let mut monitor_info: MONITORINFOEXW = unsafe { std::mem::zeroed() };
     monitor_info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
     let status = unsafe {

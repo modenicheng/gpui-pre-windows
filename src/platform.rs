@@ -8,6 +8,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
 use anyhow::{Context as _, Result, anyhow};
@@ -20,7 +21,7 @@ use windows::{
     UI::ViewManagement::UISettings,
     Win32::{
         Foundation::*,
-        Graphics::{Direct3D11::ID3D11Device, Gdi::*},
+        Graphics::Direct3D11::ID3D11Device,
         Security::Credentials::*,
         System::{
             Com::*,
@@ -39,16 +40,21 @@ use windows::{
 use crate::*;
 use gpui::*;
 
-struct TrackedWindow {
-    handle: SafeHwnd,
-    frame_signal: Arc<PlatformFrameSignal>,
+pub(crate) struct TrackedWindow {
+    pub(crate) handle: SafeHwnd,
+    pub(crate) frame_signal: Arc<PlatformFrameSignal>,
 }
 
 impl TrackedWindow {
-    fn as_raw(&self) -> HWND {
+    pub(crate) fn as_raw(&self) -> HWND {
         self.handle.as_raw()
     }
 }
+
+/// How often the controller thread checks for GPU device loss. With the
+/// per-output waiters taking over invalidation, this replaces the per-vsync
+/// device check of the former single vsync loop.
+const DEVICE_CHECK_INTERVAL: Duration = Duration::from_millis(16);
 
 pub struct WindowsPlatform {
     inner: Rc<WindowsPlatformInner>,
@@ -434,6 +440,8 @@ impl WindowsPlatform {
         self.inner.state.directx_devices.borrow_mut().take();
     }
 
+    /// Spawns the frame pacing: one controller thread that watches the GPU
+    /// devices, plus the per-output waiter threads it manages (see `vsync`).
     fn begin_vsync_thread(&self) {
         let Some(directx_devices) = self.inner.state.directx_devices.borrow().clone() else {
             return;
@@ -453,16 +461,16 @@ impl WindowsPlatform {
         std::thread::Builder::new()
             .name("VSyncProvider".to_owned())
             .spawn(move || {
-                let vsync_provider = VSyncProvider::new();
+                let mut pacing =
+                    PacingThreads::start(&directx_device, all_windows.clone(), stop.clone());
                 loop {
-                    let signal_source = vsync_provider.wait_for_vsync();
-                    let signal_at = PlatformFrameSignal::capture(scheduler::Instant::now);
                     if stop.load(Ordering::Acquire) {
                         break;
                     }
                     if check_device_lost(&directx_device.device)
                         || invalidate_devices.fetch_and(false, Ordering::Acquire)
                     {
+                        pacing.pause();
                         if let Err(err) = handle_gpu_device_lost(
                             &mut directx_device,
                             platform_window.as_raw(),
@@ -472,36 +480,13 @@ impl WindowsPlatform {
                         ) {
                             panic!("Device lost: {err}");
                         }
+                        pacing.resume(&directx_device);
                     }
-                    let Some(all_windows) = all_windows.upgrade() else {
-                        break;
-                    };
-                    for hwnd in all_windows.read().iter() {
-                        unsafe {
-                            let presents = IsWindowVisible(hwnd.as_raw()).as_bool()
-                                && !IsIconic(hwnd.as_raw()).as_bool();
-                            if let Some(signal_at) = signal_at {
-                                if presents {
-                                    hwnd.frame_signal.record(signal_at, signal_source);
-                                } else {
-                                    // Hidden windows may not consume WM_PAINT until shown again.
-                                    hwnd.frame_signal.take();
-                                }
-                            }
-                            // A hidden or minimized window has nothing to
-                            // present; invalidating it only wakes the UI
-                            // thread for a paint it cannot show. Showing a
-                            // hidden window repaints via `WM_SHOWWINDOW`, and
-                            // restoring a minimized one recreates and redraws
-                            // the swap chain via the `WM_SIZE` path.
-                            if presents {
-                                RedrawWindow(Some(hwnd.as_raw()), None, None, RDW_INVALIDATE)
-                                    .ok()
-                                    .log_err();
-                            }
-                        }
-                    }
+                    std::thread::sleep(DEVICE_CHECK_INTERVAL);
                 }
+                // The waiter threads observe the shared stop flag and exit on
+                // their own after their current wait; like this thread, they
+                // are not joined.
             })
             .unwrap();
     }
