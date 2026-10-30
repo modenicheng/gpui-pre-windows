@@ -478,19 +478,27 @@ impl WindowsPlatform {
                     };
                     for hwnd in all_windows.read().iter() {
                         unsafe {
+                            let presents = IsWindowVisible(hwnd.as_raw()).as_bool()
+                                && !IsIconic(hwnd.as_raw()).as_bool();
                             if let Some(signal_at) = signal_at {
-                                if IsWindowVisible(hwnd.as_raw()).as_bool()
-                                    && !IsIconic(hwnd.as_raw()).as_bool()
-                                {
+                                if presents {
                                     hwnd.frame_signal.record(signal_at, signal_source);
                                 } else {
                                     // Hidden windows may not consume WM_PAINT until shown again.
                                     hwnd.frame_signal.take();
                                 }
                             }
-                            RedrawWindow(Some(hwnd.as_raw()), None, None, RDW_INVALIDATE)
-                                .ok()
-                                .log_err();
+                            // A hidden or minimized window has nothing to
+                            // present; invalidating it only wakes the UI
+                            // thread for a paint it cannot show. Showing a
+                            // hidden window repaints via `WM_SHOWWINDOW`, and
+                            // restoring a minimized one recreates and redraws
+                            // the swap chain via the `WM_SIZE` path.
+                            if presents {
+                                RedrawWindow(Some(hwnd.as_raw()), None, None, RDW_INVALIDATE)
+                                    .ok()
+                                    .log_err();
+                            }
                         }
                     }
                 }
