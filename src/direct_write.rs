@@ -1867,7 +1867,13 @@ fn get_name(string: IDWriteLocalizedStrings, locale: &HSTRING) -> Result<String>
                 &mut exists as _,
             )?
         };
-        anyhow::ensure!(exists.as_bool(), "No localised string for {locale}");
+        if !exists.as_bool() {
+            // A localized string list is never empty, but it may carry neither
+            // the user locale nor en-US (e.g. a font that only ships its
+            // original-language names). Per DirectWrite guidance, fall back to
+            // the first available entry instead of dropping the name.
+            locale_name_index = 0;
+        }
     }
 
     let name_length = unsafe { string.GetStringLength(locale_name_index) }? as usize;
