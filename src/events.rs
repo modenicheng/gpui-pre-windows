@@ -196,11 +196,19 @@ impl WindowsWindowInner {
                 self.set_display(WindowsDisplay::new(
                     WindowsDisplay::display_id_for_monitor(monitor),
                 )?);
+                // Only a move that changes what the app renders to — the
+                // monitor (scale, bounds) — wakes it. The app's moved
+                // handler runs `bounds_changed`, which refreshes the window;
+                // waking it on every same-monitor WM_MOVE made each
+                // title-bar drag tick invalidate and repaint the whole tree
+                // at mouse-event rate while the client content itself never
+                // changes. The resting position still reaches persistence
+                // through the size-change path and the close capture.
+                if let Some(mut callback) = self.state.callbacks.moved.take() {
+                    callback();
+                    self.state.callbacks.moved.set(Some(callback));
+                }
             }
-        }
-        if let Some(mut callback) = self.state.callbacks.moved.take() {
-            callback();
-            self.state.callbacks.moved.set(Some(callback));
         }
         Some(0)
     }
